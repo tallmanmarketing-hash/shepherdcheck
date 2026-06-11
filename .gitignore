@@ -1,1 +1,4 @@
-node_modules/\n*.db\n.env\nfrontend/dist/
+node_modules/
+*.db
+.env
+frontend/dist/
