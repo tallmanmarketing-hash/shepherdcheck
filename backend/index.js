@@ -188,6 +188,11 @@ function superAdminOnly(req, res, next) {
   next();
 }
 
+// ============ HEALTH CHECK (no auth) ============
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 // ============ AUTH ROUTES ============
 
 // Signup — new church requests access
