@@ -29,6 +29,11 @@ if (fs.existsSync(frontendPath)) {
   console.log('✓ Serving frontend from', frontendPath);
 }
 
+// Health check endpoint (no auth required)
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok' });
+});
+
 // ============ Database ============
 
 const db = new Database(path.join(__dirname, 'shepherdcheck.db'));
