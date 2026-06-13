@@ -4,10 +4,12 @@ const path = require('path');
 const fs = require('fs');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const stripe = process.env.STRIPE_SECRET_KEY ? require('stripe')(process.env.STRIPE_SECRET_KEY) : null;
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'shepherdcheck-dev-secret-change-in-prod';
+const FREE_TIER_CHILD_LIMIT = 50;
 
 // Twilio (optional — SMS works without it, just logs)
 let twilioClient = null;
@@ -92,6 +94,11 @@ const initDb = async () => {
     phone TEXT DEFAULT '',
     address TEXT DEFAULT '',
     status TEXT NOT NULL DEFAULT 'pending',  -- pending, active, suspended
+    stripe_customer_id TEXT,
+    stripe_subscription_id TEXT,
+    subscription_tier TEXT DEFAULT 'free',  -- free, pro
+    subscription_status TEXT,
+    current_period_end DATETIME,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 
@@ -154,6 +161,17 @@ const initDb = async () => {
   CREATE INDEX IF NOT EXISTS idx_children_tenant ON children(tenant_id);
   CREATE INDEX IF NOT EXISTS idx_children_family ON children(family_id);
 `);
+
+  // Simple migrations for existing tenants table (to add Stripe columns)
+  const columns = db.prepare("PRAGMA table_info(tenants)").all();
+  const columnNames = columns.map(c => c.name);
+  if (!columnNames.includes('stripe_customer_id')) {
+    db.exec("ALTER TABLE tenants ADD COLUMN stripe_customer_id TEXT;");
+    db.exec("ALTER TABLE tenants ADD COLUMN stripe_subscription_id TEXT;");
+    db.exec("ALTER TABLE tenants ADD COLUMN subscription_tier TEXT DEFAULT 'free';");
+    db.exec("ALTER TABLE tenants ADD COLUMN subscription_status TEXT;");
+    db.exec("ALTER TABLE tenants ADD COLUMN current_period_end DATETIME;");
+  }
 
 // Create default super admin and demo tenant if none exist
 const userCount = db.prepare("SELECT COUNT(*) as c FROM users WHERE role = 'super_admin'").get();
@@ -296,7 +314,7 @@ app.post('/api/login', (req, res) => {
     }
     
     const user = db.prepare(`
-      SELECT u.*, t.name as tenant_name, t.slug as tenant_slug, t.status as tenant_status
+      SELECT u.*, t.name as tenant_name, t.slug as tenant_slug, t.status as tenant_status, t.subscription_tier
       FROM users u LEFT JOIN tenants t ON u.tenant_id = t.id
       WHERE u.email = ?
     `).get(email);
@@ -328,7 +346,8 @@ app.post('/api/login', (req, res) => {
         role: user.role,
         tenantId: user.tenant_id,
         tenantName: user.tenant_name,
-        tenantSlug: user.tenant_slug
+        tenantSlug: user.tenant_slug,
+        subscriptionTier: user.subscription_tier
       }
     });
   } catch (err) {
@@ -340,7 +359,7 @@ app.post('/api/login', (req, res) => {
 // Get current user
 app.get('/api/me', authMiddleware, (req, res) => {
   if (req.user.tenantId) {
-    const tenant = db.prepare('SELECT * FROM tenants WHERE id = ?').get(req.user.tenantId);
+    const tenant = db.prepare('SELECT id, name, slug, email, status, subscription_tier, current_period_end FROM tenants WHERE id = ?').get(req.user.tenantId);
     res.json({ ...req.user, tenant });
   } else {
     res.json({ ...req.user, tenant: null });
@@ -487,6 +506,15 @@ app.post('/api/children', authMiddleware, (req, res) => {
     const family = db.prepare('SELECT id FROM families WHERE id = ? AND tenant_id = ?').get(family_id, tenantId);
     if (!family) {
       return res.status(404).json({ error: 'Family not found' });
+    }
+
+    // Enforce free tier limit
+    const tenant = db.prepare('SELECT subscription_tier FROM tenants WHERE id = ?').get(tenantId);
+    if (tenant.subscription_tier === 'free') {
+      const childCount = db.prepare('SELECT COUNT(*) as count FROM children WHERE tenant_id = ?').get(tenantId);
+      if (childCount.count >= FREE_TIER_CHILD_LIMIT) {
+        return res.status(403).json({ error: `Free tier is limited to ${FREE_TIER_CHILD_LIMIT} children. Please upgrade to Pro for more.` });
+      }
     }
     
     const result = db.prepare(
@@ -719,6 +747,123 @@ app.get('/api/history', authMiddleware, (req, res) => {
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch history' });
   }
+});
+
+// ============ BILLING & SUBSCRIPTIONS ============
+
+app.get('/api/billing/config', (req, res) => {
+  res.json({
+    publishableKey: process.env.STRIPE_PUBLISHABLE_KEY,
+    tiers: [
+      { id: 'free', name: 'Free', limit: FREE_TIER_CHILD_LIMIT, price: 0 },
+      { id: 'pro', name: 'Pro', limit: 'Unlimited', price: 2900, currency: 'usd' }
+    ]
+  });
+});
+
+app.get('/api/billing/status', authMiddleware, (req, res) => {
+  const tenant = db.prepare('SELECT subscription_tier, subscription_status, current_period_end FROM tenants WHERE id = ?').get(req.user.tenantId);
+  res.json(tenant);
+});
+
+app.post('/api/billing/create-checkout-session', authMiddleware, async (req, res) => {
+  try {
+    if (!stripe) {
+      return res.status(500).json({ error: 'Stripe is not configured' });
+    }
+
+    const tenantId = req.user.tenantId;
+    const tenant = db.prepare('SELECT * FROM tenants WHERE id = ?').get(tenantId);
+    
+    // Create or retrieve Stripe customer
+    let customerId = tenant.stripe_customer_id;
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: tenant.email,
+        name: tenant.name,
+        metadata: { tenantId }
+      });
+      customerId = customer.id;
+      db.prepare('UPDATE tenants SET stripe_customer_id = ? WHERE id = ?').run(customerId, tenantId);
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      customer: customerId,
+      payment_method_types: ['card'],
+      line_items: [
+        {
+          price: process.env.STRIPE_PRO_PRICE_ID, // Use environment variable for the price ID
+          quantity: 1,
+        },
+      ],
+      mode: 'subscription',
+      success_url: `${process.env.PUBLIC_URL || 'http://localhost:3000'}/dashboard?payment=success`,
+      cancel_url: `${process.env.PUBLIC_URL || 'http://localhost:3000'}/dashboard?payment=cancelled`,
+      metadata: { tenantId }
+    });
+
+    res.json({ sessionId: session.id, url: session.url });
+  } catch (err) {
+    console.error('Stripe checkout error:', err);
+    res.status(500).json({ error: 'Failed to create checkout session' });
+  }
+});
+
+app.post('/api/billing/webhook', express.raw({type: 'application/json'}), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    if (!stripe) throw new Error('Stripe not configured');
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  // Handle the event
+  switch (event.type) {
+    case 'checkout.session.completed': {
+      const session = event.data.object;
+      const tenantId = session.metadata.tenantId;
+      const subscriptionId = session.subscription;
+      
+      const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+      
+      db.prepare(`
+        UPDATE tenants SET 
+          stripe_subscription_id = ?,
+          subscription_tier = 'pro',
+          subscription_status = ?,
+          current_period_end = datetime(?, 'unixepoch')
+        WHERE id = ?
+      `).run(subscriptionId, subscription.status, subscription.current_period_end, tenantId);
+      break;
+    }
+    case 'customer.subscription.updated':
+    case 'customer.subscription.deleted': {
+      const subscription = event.data.object;
+      const customerId = subscription.customer;
+      const tenant = db.prepare('SELECT id FROM tenants WHERE stripe_customer_id = ?').get(customerId);
+      
+      if (tenant) {
+        db.prepare(`
+          UPDATE tenants SET 
+            subscription_status = ?,
+            subscription_tier = ?,
+            current_period_end = datetime(?, 'unixepoch')
+          WHERE id = ?
+        `).run(
+          subscription.status, 
+          subscription.status === 'active' ? 'pro' : 'free',
+          subscription.current_period_end,
+          tenant.id
+        );
+      }
+      break;
+    }
+  }
+
+  res.json({received: true});
 });
 
 // ============ SPA fallback ============
