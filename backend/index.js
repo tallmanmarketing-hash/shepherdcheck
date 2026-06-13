@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
-const Database = require('better-sqlite3');
 const path = require('path');
+const fs = require('fs');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
@@ -23,19 +23,66 @@ app.use(express.json());
 
 // In production, serve the built frontend
 const frontendPath = path.join(__dirname, '..', 'frontend', 'dist');
-const fs = require('fs');
 if (fs.existsSync(frontendPath)) {
   app.use(express.static(frontendPath));
   console.log('✓ Serving frontend from', frontendPath);
 }
 
-// ============ Database ============
+// ============ Database (sql.js — pure JS, no native deps) ============
 
-const db = new Database(path.join(__dirname, 'shepherdcheck.db'));
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+let db;
+const DB_PATH = path.join(__dirname, 'shepherdcheck.db');
 
-db.exec(`
+// Simple wrapper to make sql.js look like better-sqlite3's API
+class DB {
+  constructor(sqlDb) { this._db = sqlDb; this._dirty = false; }
+  pragma(str) { this._db.run(`PRAGMA ${str}`); }
+  exec(sql) { this._db.run(sql); this._dirty = true; }
+  prepare(sql) { return new Stmt(this._db, sql, this); }
+  save() {
+    if (!this._dirty) return;
+    const data = this._db.export();
+    fs.writeFileSync(DB_PATH, Buffer.from(data));
+    this._dirty = false;
+  }
+}
+
+class Stmt {
+  constructor(sqlDb, sql, parent) { this._db = sqlDb; this._sql = sql; this._parent = parent; }
+  get(...params) {
+    const s = this._db.prepare(this._sql);
+    if (params.length) s.bind(params);
+    const r = s.step() ? s.getAsObject() : undefined;
+    s.free(); return r;
+  }
+  all(...params) {
+    const s = this._db.prepare(this._sql);
+    if (params.length) s.bind(params);
+    const r = []; while (s.step()) r.push(s.getAsObject());
+    s.free(); return r;
+  }
+  run(...params) {
+    this._db.run(this._sql, params);
+    this._parent._dirty = true;
+    const idR = this._db.exec("SELECT last_insert_rowid() as id");
+    const chR = this._db.exec("SELECT changes() as c");
+    return {
+      lastInsertRowid: idR[0]?.values[0]?.[0] || 0,
+      changes: chR[0]?.values[0]?.[0] || 0
+    };
+  }
+}
+
+const initDb = async () => {
+  const initSqlJs = require('sql.js');
+  const SQL = await initSqlJs();
+  let buffer = null;
+  if (fs.existsSync(DB_PATH)) buffer = fs.readFileSync(DB_PATH);
+  db = new DB(new SQL.Database(buffer));
+  db.pragma('journal_mode = DELETE');
+  db.pragma('foreign_keys = ON');
+
+  db.exec(`
   -- Churches (tenants)
   CREATE TABLE IF NOT EXISTS tenants (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,10 +174,11 @@ if (userCount.c === 0) {
   ).run(demo.lastInsertRowid, 'demo@firstchurch.org', demoHash, 'Demo Admin', 'admin');
   
   console.log('✓ Created super admin: admin@shepherdcheck.com / admin123');
-  console.log('✓ Created demo church: demo@firstchurch.org / demo123');
-}
+        console.log('✓ Created demo church: demo@firstchurch.org / demo123');
+      }
+  }
 
-// ============ Helpers ============
+  // ============ Helpers ============
 
 function generateCode(tenantId) {
   const code = Math.floor(1000 + Math.random() * 9000).toString();
@@ -685,11 +733,21 @@ if (fs.existsSync(frontendIndex)) {
 
 // ============ Start ============
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n🐑 ShepherdCheck running on http://0.0.0.0:${PORT}`);
-  if (!process.env.JWT_SECRET) {
-    console.log('⚠ Set JWT_SECRET environment variable in production');
-  }
-  console.log(`   Super admin: admin@shepherdcheck.com / admin123`);
-  console.log(`   Demo church: demo@firstchurch.org / demo123\n`);
+async function start() {
+  await initDb();
+  db.save(); // persist initial seed data
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`\n🐑 ShepherdCheck running on http://0.0.0.0:${PORT}`);
+    if (!process.env.JWT_SECRET) {
+      console.log('⚠ Set JWT_SECRET environment variable in production');
+    }
+    console.log(`   Super admin: admin@shepherdcheck.com / admin123`);
+    console.log(`   Demo church: demo@firstchurch.org / demo123\n`);
+  });
+}
+
+start().catch(err => {
+  console.error('Failed to start:', err);
+  process.exit(1);
 });
